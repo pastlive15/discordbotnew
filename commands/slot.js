@@ -11,9 +11,9 @@ const COLORS = { GREEN: 0x22c55e, RED: 0xef4444, GOLD: 0xf59e0b };
 
 // >= 6–7 symbols so "no match" still possible on 4 reels
 const SYMBOLS = [
-  '<:DP_slots_eggplant93:1392958941381791924>',
-  '<:dp_slots_hearts33:1392958885379444746>',
-  '<:DP_slots_cherry:1392959017281654784>',
+  '👑',
+  '⚜️',
+  '🍀',
   '🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'
 ];
 
@@ -31,10 +31,10 @@ const PAYOUTS = Object.freeze({
 });
 
 // Slightly easier jackpots
-const JACKPOT_REROLL_P = 0.50; // was 0.80
+const JACKPOT_REROLL_P = 0.60; // was 0.80
 
 // Small bias to repeat previous symbols on later reels (↑ pairs/triples a bit)
-const REPEAT_BIAS = 0.10; // 10%
+const REPEAT_BIAS = 0.15; // 10%
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
 
