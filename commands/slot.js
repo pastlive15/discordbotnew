@@ -1,101 +1,150 @@
 // commands/slot.js
-// Balanced Slot (v2): easier win rate a bit + new payouts.
-// - 4 reels, richer symbols, proper losing outcomes.
-// - Slight "repeat bias" to increase pairs/triples a little.
-// - Atomic UPDATE; "all" bet supported; profit multiplier applies to profit only.
+// Slots with 3 special symbols (👑, ⚜️, 🍀) each having unique rarity & payouts.
+// - Chooses the SINGLE best-paying rule if multiple match (no stacking).
+// - Reduced single-pair frequency (repeat bias + first-pair veto).
+// - Profit multiplier applies to PROFIT only. Atomic balance update.
 
 const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const { initUser } = require('../utils/initUser');
 
 const COLORS = { GREEN: 0x22c55e, RED: 0xef4444, GOLD: 0xf59e0b };
 
-// >= 6–7 symbols so "no match" still possible on 4 reels
-const SYMBOLS = [
-  '👑',
-  '⚜️',
-  '🍀',
-  '🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'
-];
+const SPECIAL = {
+  CROWN: '👑', // rarest, biggest payouts
+  FLEUR: '⚜️', // middle
+  CLOVER: '🍀', // less rare but still premium
+};
+
+// Symbols: 3 special + normals (>=6) -> losing outcomes still possible on 4 reels.
+const NORMALS = ['🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'];
+const SYMBOLS = [SPECIAL.CROWN, SPECIAL.FLEUR, SPECIAL.CLOVER, ...NORMALS];
+
+// Weighted rarity: larger weight => more common
+// (relative weights; normalized at pick time)
+const WEIGHTS = {
+  [SPECIAL.CROWN]: 0.05, // rarest
+  [SPECIAL.FLEUR]: 0.10,
+  [SPECIAL.CLOVER]: 0.20,
+  '🍋': 1.0, '🍉': 1.0, '🍇': 1.0, '⭐': 1.0, '🔔': 1.0, '7️⃣': 1.0,
+};
 
 const REELS = 4;
 const REEL_DELAY_MS = 550;
 const SPIN_EMOJI = '<a:DP_slots_spin28:1392958778692997190>' || '🔄';
 
-// Friendlier payouts from previous step
-const PAYOUTS = Object.freeze({
+// Generic payouts (for non-special hands)
+const GENERIC_PAYOUTS = Object.freeze({
   four_kind: 12.0,
   three_kind: 4.0,
   two_pairs: 2.5,
-  one_pair: 0.8, // still a small loss
+  one_pair: 0.8, // small loss
   none: 0.0,
 });
 
-// Jackpots a bit easier than before (kept)
+// Special payouts (override if higher)
+const SPECIAL_PAYOUTS = Object.freeze({
+  [SPECIAL.CROWN]: { 2: 3.0, 3: 8.0, 4: 25.0 }, // highest jackpot
+  [SPECIAL.FLEUR]: { 2: 2.0, 3: 5.0, 4: 15.0 },
+  [SPECIAL.CLOVER]: { 2: 1.5, 3: 3.5, 4: 10.0 },
+});
+
+// Slightly easier jackpots than original baseline
 const JACKPOT_REROLL_P = 0.50;
 
-// --- New tuning knobs to cut "one pair" frequency ---
-const REPEAT_BIAS = 0.06; // was 0.10 -> lower chance to copy previous symbols
-// If the current pick would create the FIRST pair of the spin (no pair existed yet),
-// we veto it with these probabilities per reel index (1-based thinking: reels 2..4).
-// High veto at reel 2 (strong cut of single-pair), milder at reel 3..4 to preserve 3-kind/two-pairs.
-const SINGLE_PAIR_VETO = [0.00, 0.60, 0.35, 0.20]; // index by i (0..3), used for i>0
+// Tuning to reduce single-pair spam
+const REPEAT_BIAS = 0.06;                         // chance to copy a previous reel
+const SINGLE_PAIR_VETO = [0.00, 0.60, 0.35, 0.20]; // veto first pair on reels 2..4
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
 
-function randomSymbol(exclude = null) {
-  if (!exclude || exclude.size === 0 || exclude.size >= SYMBOLS.length) {
-    return SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+// ---------- Weighted random utilities ----------
+function weightedPick(candidates) {
+  // candidates: array of symbols to choose from (respect weights)
+  let total = 0;
+  for (const s of candidates) total += WEIGHTS[s] ?? 1.0;
+  let r = Math.random() * total;
+  for (const s of candidates) {
+    const w = WEIGHTS[s] ?? 1.0;
+    if ((r -= w) <= 0) return s;
   }
-  // pick a symbol not in exclude (try a few times; fallback to any)
-  const pool = SYMBOLS.filter(s => !exclude.has(s));
-  if (pool.length === 0) return SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
-  return pool[Math.floor(Math.random() * pool.length)];
+  return candidates[candidates.length - 1];
 }
 
-function classify(result) {
-  const count = {};
-  for (const s of result) count[s] = (count[s] || 0) + 1;
-  const freqs = Object.values(count).sort((a, b) => b - a);
-  if (freqs[0] === 4) return 'four_kind';
-  if (freqs[0] === 3) return 'three_kind';
+function randomSymbol(excludeSet = null) {
+  const pool = excludeSet
+    ? SYMBOLS.filter(s => !excludeSet.has(s))
+    : SYMBOLS.slice();
+  if (pool.length === 0) return SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+  return weightedPick(pool);
+}
+
+// ---------- Hand helpers ----------
+function classifyCounts(arr) {
+  const map = {};
+  for (const s of arr) map[s] = (map[s] || 0) + 1;
+  return map;
+}
+
+function genericHandMultiplier(countMap) {
+  const freqs = Object.values(countMap).sort((a, b) => b - a); // e.g. [2,2], [3,1], [1,1,1,1]
+  if (freqs[0] === 4) return GENERIC_PAYOUTS.four_kind;
+  if (freqs[0] === 3) return GENERIC_PAYOUTS.three_kind;
   if (freqs[0] === 2) {
     const pairs = freqs.filter(v => v === 2).length;
-    if (pairs === 2) return 'two_pairs';
-    return 'one_pair';
+    return pairs === 2 ? GENERIC_PAYOUTS.two_pairs : GENERIC_PAYOUTS.one_pair;
   }
-  return 'none';
+  return GENERIC_PAYOUTS.none;
 }
 
+function specialMultiplier(countMap) {
+  // Pick the BEST special rule that applies (no stacking)
+  let best = 0;
+  for (const sym of [SPECIAL.CROWN, SPECIAL.FLEUR, SPECIAL.CLOVER]) {
+    const k = countMap[sym] || 0;
+    if (k >= 2) {
+      const table = SPECIAL_PAYOUTS[sym];
+      const m = table[k] || 0;
+      if (m > best) best = m;
+    }
+  }
+  return best;
+}
+
+function bestMultiplier(result) {
+  const counts = classifyCounts(result);
+  const g = genericHandMultiplier(counts);
+  const s = specialMultiplier(counts);
+  return Math.max(g, s);
+}
+
+// ---------- Pair-veto logic ----------
 function aboutToCreateFirstPair(currentSymbols, candidate) {
   if (currentSymbols.length === 0) return false;
-  // Count existing
   const count = {};
   for (const s of currentSymbols) count[s] = (count[s] || 0) + 1;
   const hasPairAlready = Object.values(count).some(v => v >= 2);
-  if (hasPairAlready) return false; // not the *first* pair
-
-  // Would candidate match any existing symbol and make a pair?
-  return currentSymbols.includes(candidate);
+  if (hasPairAlready) return false;        // we only veto the very first pair of this spin
+  return currentSymbols.includes(candidate); // would candidate create that first pair?
 }
 
+// ---------- Rolling ----------
 function rollOnce() {
   const result = [];
   for (let i = 0; i < REELS; i++) {
-    // default candidate: repeat bias or fresh draw
     let candidate;
     if (i > 0 && Math.random() < REPEAT_BIAS) {
+      // copy one of the previous reels (bias towards matches)
       const j = Math.floor(Math.random() * i);
       candidate = result[j];
     } else {
       candidate = randomSymbol();
     }
 
-    // If this would create the *first* pair, veto with probability SINGLE_PAIR_VETO[i]
+    // If this would create the *first* pair, possibly veto (avoid creating easy one-pair)
     if (i > 0 && aboutToCreateFirstPair(result, candidate)) {
       const vetoP = SINGLE_PAIR_VETO[i] || 0;
       if (Math.random() < vetoP) {
-        // try to pick a symbol that doesn't appear yet (avoid making that first pair)
-        const exclude = new Set(result); // avoid *any* seen so far
+        const exclude = new Set(result); // pick something unseen so far
         candidate = randomSymbol(exclude);
       }
     }
@@ -106,16 +155,21 @@ function rollOnce() {
 }
 
 function rollResult() {
-  let r, hand;
+  let r, mult;
   do {
     r = rollOnce();
-    hand = classify(r);
-    if (hand === 'four_kind' && Math.random() < JACKPOT_REROLL_P) continue;
+    mult = bestMultiplier(r);
+    // Optionally reduce 4-kind frequency overall (applies to special too)
+    // If you want to *exclude* crowns from reroll, check counts before rerolling.
+    const counts = classifyCounts(r);
+    const isFourKind = Object.values(counts).some(v => v === 4);
+    if (isFourKind && Math.random() < JACKPOT_REROLL_P) continue;
     break;
   } while (true);
-  return { result: r, hand };
+  return { result: r, multiplier: mult };
 }
 
+// ---------- Command ----------
 module.exports = {
   name: 'slot',
   description: 'Spin a slot machine and try your luck!',
@@ -149,7 +203,6 @@ module.exports = {
         flags: MessageFlags.Ephemeral
       });
     }
-
     if (wallet <= 0) {
       return interaction.reply({ content: '💸 Your wallet is empty.', flags: MessageFlags.Ephemeral });
     }
@@ -164,7 +217,7 @@ module.exports = {
       fetchReply: true,
     });
 
-    const { result, hand } = rollResult();
+    const { result, multiplier } = rollResult();
 
     // Reveal reels one-by-one
     const display = [...spinningRow];
@@ -174,20 +227,33 @@ module.exports = {
       await interaction.editReply({ content: `🎰 Spinning...\n${display.join(' | ')}` });
     }
 
-    // Payout (profit-only multiplier)
-    const multiplier = PAYOUTS[hand] ?? 0;
-    const rawReturn = bet * multiplier;
+    // Compute payout; profit-only multiplier
+    const rawReturn = bet * (multiplier ?? 0);
     const totalBase = Math.floor(rawReturn);
     const isWin = totalBase > bet;
 
     const profit = isWin ? Math.floor((totalBase - bet) * coinMult) : 0;
     const winnings = isWin ? (bet + profit) : totalBase;
+
+    // Outcome text (show which rule likely applied)
+    const counts = classifyCounts(result);
+    const genericM = genericHandMultiplier(counts);
+    const specialM = specialMultiplier(counts);
+    const used = specialM > genericM ? 'special' : 'generic';
+    const handStr = specialM > genericM
+      ? 'special combo'
+      : (genericM === GENERIC_PAYOUTS.four_kind ? 'four of a kind'
+        : genericM === GENERIC_PAYOUTS.three_kind ? 'three of a kind'
+        : genericM === GENERIC_PAYOUTS.two_pairs ? 'two pairs'
+        : genericM === GENERIC_PAYOUTS.one_pair ? 'one pair'
+        : 'no match');
+
     const outcomeStr =
       isWin
-        ? `🎉 You won **${fmt(winnings - bet)}** coins profit! (${hand.replace('_', ' ')} · base x${multiplier.toFixed(1)}, profit×${coinMult.toFixed(2)})`
+        ? `🎉 You won **${fmt(winnings - bet)}** coins profit! (${handStr} · ${used} x${(multiplier || 0).toFixed(1)}, profit×${coinMult.toFixed(2)})`
         : winnings === bet
-          ? `😐 Break-even. (${hand.replace('_', ' ')})`
-          : `😢 You lost **${fmt(bet - winnings)}** coins. (${hand.replace('_', ' ')})`;
+          ? `😐 Break-even. (${handStr})`
+          : `😢 You lost **${fmt(bet - winnings)}** coins. (${handStr})`;
 
     // Atomic balance update
     const { rows, rowCount } = await db.query(
