@@ -1,46 +1,73 @@
 // commands/slot.js
-// PostgreSQL-compatible Slot Command (4-reel, "bet all", atomic balance update)
-// - Atomic UPDATE ... WHERE money >= bet RETURNING
-// - "all" uses current wallet; blocks if wallet is 0
-// - Coin multiplier applies to PROFIT only (not to losses), consistent with spinwheel
-// - Simple anti-jackpot re-roll (95% re-roll chance if 4-of-a-kind)
+// Balanced Slot: 4 reels, richer symbol set, proper losing outcomes.
+// - Atomic UPDATE with WHERE money >= bet RETURNING
+// - "all" supported
+// - Profit multiplier applies to PROFIT only (not losses), same policy as before.
 
 const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const { initUser } = require('../utils/initUser');
 
 const COLORS = { GREEN: 0x22c55e, RED: 0xef4444, GOLD: 0xf59e0b };
+
+// Keep your custom guild emojis first, then safe Unicode fallbacks.
 const SYMBOLS = [
   '<:DP_slots_eggplant93:1392958941381791924>',
   '<:dp_slots_hearts33:1392958885379444746>',
   '<:DP_slots_cherry:1392959017281654784>',
-];
+  '🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'
+]; // >= 6 symbols so "no match" is possible on 4 reels
+
 const REELS = 4;
 const REEL_DELAY_MS = 550;
-const SPIN_EMOJI = '<a:DP_slots_spin28:1392958778692997190>';
+const SPIN_EMOJI = '<a:DP_slots_spin28:1392958778692997190>' || '🔄';
 
-const PAYOUTS = {
-  4: 5.0,   // 4 of a kind → x5
-  3: 2.0,   // 3 of a kind → x2
-  2: 1.2,   // any pair    → x1.2
-  1: 0.0,   // none        → x0 (lose full bet)
-};
+// New balanced payouts
+// - 4-kind: big jackpot
+// - 3-kind: solid win
+// - two_pairs: decent win
+// - one_pair: small loss (house edge)
+// - none: full loss
+const PAYOUTS = Object.freeze({
+  four_kind: 10.0,   // x10
+  three_kind: 3.0,   // x3
+  two_pairs: 2.0,    // x2
+  one_pair: 0.5,     // x0.5 (lose half)
+  none: 0.0,         // x0
+});
+
+// Soften pure jackpot spikes (re-roll 80% if 4OAK)
+const JACKPOT_REROLL_P = 0.80;
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
 
-function rollResult() {
-  let result;
-  do {
-    result = Array.from({ length: REELS }, () => SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)]);
-    if (result.every(v => v === result[0]) && Math.random() < 0.95) continue; // soften 4OAK
-    break;
-  } while (true);
-  return result;
+function rollOnce() {
+  return Array.from({ length: REELS }, () => SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)]);
 }
 
-function maxOfAKind(result) {
+function classify(result) {
+  // count frequencies
   const count = {};
   for (const s of result) count[s] = (count[s] || 0) + 1;
-  return Math.max(...Object.values(count));
+  const freqs = Object.values(count).sort((a, b) => b - a); // e.g., [2,2] or [3,1] or [1,1,1,1]
+  if (freqs[0] === 4) return 'four_kind';
+  if (freqs[0] === 3) return 'three_kind';
+  if (freqs[0] === 2) {
+    const pairs = freqs.filter(v => v === 2).length;
+    if (pairs === 2) return 'two_pairs';
+    return 'one_pair';
+  }
+  return 'none';
+}
+
+function rollResult() {
+  let r, hand;
+  do {
+    r = rollOnce();
+    hand = classify(r);
+    if (hand === 'four_kind' && Math.random() < JACKPOT_REROLL_P) continue;
+    break;
+  } while (true);
+  return { result: r, hand };
 }
 
 module.exports = {
@@ -56,7 +83,8 @@ module.exports = {
     ),
 
   async execute(interaction, db) {
-    const user = await initUser(interaction.user);
+    // NOTE: make sure initUser takes (user, db) like your other modules
+    const user = await initUser(interaction.user, db); // was initUser(interaction.user) before
     if (!user) {
       return interaction.reply({ content: '❌ You need a profile to play.', flags: MessageFlags.Ephemeral });
     }
@@ -84,21 +112,20 @@ module.exports = {
     if (wallet <= 0) {
       return interaction.reply({ content: '💸 Your wallet is empty.', flags: MessageFlags.Ephemeral });
     }
-
     if (wallet < bet) {
       return interaction.reply({ content: `💸 You don’t have enough coins. Balance: **${fmt(wallet)}**`, flags: MessageFlags.Ephemeral });
     }
 
-    // Animated spin (plain message first, then edit)
+    // Animated spin (message then edit)
     const spinningRow = Array(REELS).fill(SPIN_EMOJI);
-    const replyMsg = await interaction.reply({
+    await interaction.reply({
       content: `🎰 Spinning...\n${spinningRow.join(' | ')}`,
       fetchReply: true,
     });
 
-    const result = rollResult();
+    const { result, hand } = rollResult();
 
-    // Reveal reels one by one
+    // Reveal reels one-by-one
     const display = [...spinningRow];
     for (let i = 0; i < REELS; i++) {
       await new Promise(r => setTimeout(r, REEL_DELAY_MS));
@@ -106,17 +133,20 @@ module.exports = {
       await interaction.editReply({ content: `🎰 Spinning...\n${display.join(' | ')}` });
     }
 
-    // Compute payout → apply coin multiplier to profits only
-    const ofAKind = maxOfAKind(result);
-    const multiplier = PAYOUTS[ofAKind] ?? 0;
-    const rawPayout = bet * multiplier;
-    const baseWin = Math.floor(rawPayout);              // total back before multiplier logic
-    const isWin = baseWin > bet;
+    // Compute payout with new table; profit-only multiplier
+    const multiplier = PAYOUTS[hand] ?? 0;
+    const rawReturn = bet * multiplier;
+    const totalBase = Math.floor(rawReturn);
+    const isWin = totalBase > bet;
 
-    // Profit only portion
-    const profit = isWin ? Math.floor((baseWin - bet) * coinMult) : 0;
-    const winnings = isWin ? (bet + profit) : baseWin; // total credited this spin
-    const netChange = winnings - bet;
+    const profit = isWin ? Math.floor((totalBase - bet) * coinMult) : 0;
+    const winnings = isWin ? (bet + profit) : totalBase;
+    const outcomeStr =
+      isWin
+        ? `🎉 You won **${fmt(winnings - bet)}** coins profit! (${hand.replace('_', ' ')} · base x${multiplier.toFixed(1)}, profit×${coinMult.toFixed(2)})`
+        : winnings === bet
+          ? `😐 Break-even. (${hand.replace('_', ' ')})`
+          : `😢 You lost **${fmt(bet - winnings)}** coins. (${hand.replace('_', ' ')})`;
 
     // Atomic balance update
     const { rows, rowCount } = await db.query(
@@ -131,7 +161,6 @@ module.exports = {
     );
 
     if (rowCount === 0) {
-      // Balance changed mid-spin; bet not deducted
       const warn = new EmbedBuilder()
         .setColor(COLORS.RED)
         .setTitle('Balance Changed')
@@ -142,13 +171,6 @@ module.exports = {
 
     const newBalance = Number(rows[0].money || 0);
 
-    const outcome =
-      winnings > bet
-        ? `🎉 You won **${fmt(winnings - bet)}** coins profit! (x${multiplier.toFixed(1)} base, profit×${coinMult.toFixed(2)})`
-        : winnings === bet
-          ? `😐 Break-even.`
-          : `😢 You lost **${fmt(bet - winnings)}** coins.`;
-
     const embed = new EmbedBuilder()
       .setTitle('🎰 Slot Machine Result')
       .setColor(winnings > bet ? COLORS.GREEN : winnings === bet ? COLORS.GOLD : COLORS.RED)
@@ -156,7 +178,7 @@ module.exports = {
         `🎲 **Result:**\n${result.join(' | ')}\n\n` +
         `💰 **Bet:** ${fmt(bet)}\n` +
         `🎁 **Return:** ${fmt(winnings)}\n` +
-        `${outcome}\n\n` +
+        `${outcomeStr}\n\n` +
         `<a:PixelCoin:1392196932926967858> **Balance:** ${fmt(newBalance)}`
       )
       .setFooter({ text: interaction.user.username, iconURL: interaction.user.displayAvatarURL({ forceStatic: false }) })
