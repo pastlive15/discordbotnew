@@ -23,14 +23,13 @@ module.exports = {
       const commandsMap = interaction.client.commands; // filled by your loader
       if (!commandsMap || commandsMap.size === 0) {
         return interaction.reply({
-          content: 'ยังไม่มีคำสั่งที่ถูกโหลดเข้ามา',
+          content: 'No commands are currently loaded.',
           ephemeral: true,
         });
       }
 
       // ---------- Specific command help ----------
       if (cmdName) {
-        // หาแบบ case-insensitive
         const key = cmdName.toLowerCase();
         const found =
           commandsMap.get(key) ||
@@ -40,7 +39,7 @@ module.exports = {
 
         if (!found) {
           return interaction.reply({
-            content: `ไม่พบคำสั่ง \`${cmdName}\` ลองพิมพ์ \`/help\` เพื่อดูรายการทั้งหมด`,
+            content: `Command \`${cmdName}\` not found. Use \`/help\` to see the full list.`,
             ephemeral: true,
           });
         }
@@ -90,7 +89,6 @@ module.exports = {
         .filter(x => !!x.name)
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      // สร้างข้อความเป็นบล็อกและแตกเป็นหลายฟิลด์ให้พอดีกับลิมิต Discord
       const lines = list.map(x => `• **/${x.name}** — ${x.desc}`);
       const chunks = [];
       let buf = '';
@@ -108,8 +106,8 @@ module.exports = {
         .setTitle('📚 Command List')
         .setColor(0x5865f2)
         .setDescription(
-          `ใช้ \`/help command:<ชื่อคำสั่ง>\` เพื่อดูรายละเอียดรายคำสั่ง\n` +
-            `ตัวอย่าง: \`/help command:ping\``
+          `Use \`/help command:<name>\` to get details about a specific command\n` +
+            `Example: \`/help command:ping\``
         )
         .addFields(
           ...chunks.map((chunk, idx) => ({
@@ -127,12 +125,11 @@ module.exports = {
       return interaction.reply({ embeds: [embed], ephemeral: true });
     } catch (err) {
       console.error('help.js error:', err);
-      // fallback ข้อความล้วน
       const names = [...(interaction.client.commands?.keys() || [])]
         .map(n => `/${n}`)
         .join(', ');
       const content =
-        names || 'ยังไม่มีคำสั่งในบอทตอนนี้ ลองเพิ่มไฟล์ในโฟลเดอร์ commands/';
+        names || 'No commands found. Add files to the commands/ folder first.';
       if (interaction.deferred || interaction.replied) {
         return interaction.editReply({ content }).catch(() => {});
       }
