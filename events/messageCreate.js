@@ -1,6 +1,8 @@
 // events/messageCreate.js
-// Refactor from scratch: balanced per-message XP + Big Heist trigger,
-// strong guards, cleaner structure, and fewer side-effects.
+// Spec: No cooldown, no "message quality" factor.
+// XP is drawn from bands 5–9 (common), 10–20 (less common), 21–30 (rare).
+// Within each band, higher XP has lower probability (monotone decreasing).
+// Final XP is clamped to dynamic [min..max] derived from xpToNext(level).
 
 const {
   Events,
@@ -13,39 +15,16 @@ const {
 const { xpToNext } = require('../utils/levelUtils');
 const { initUser } = require('../utils/initUser');
 
-// ---------------- Heist config/state ----------------
+// ---------- Heist (kept as before) ----------
 const HEIST = Object.freeze({
-  COOLDOWN_MS: 2 * 60 * 60 * 1000,  // 2h between spawns
-  CHANCE_PER_MSG: 0.015,            // 1.5% per eligible message
-  DURATION_MS: 5 * 60 * 1000,       // 5 minutes active
+  COOLDOWN_MS: 2 * 60 * 60 * 1000, // 2h between spawns
+  CHANCE_PER_MSG: 0.015,           // 1.5% per eligible message
+  DURATION_MS: 5 * 60 * 1000,      // active 5m
 });
 let heistActive = false;
 let lastHeistSpawnAt = 0;
 let heistTimer = null;
 
-// ---------------- XP config/state ----------------
-const XP = Object.freeze({
-  COOLDOWN_MS: 20 * 1000,         // anti-spam: 20s per user
-  MESSAGES_PER_LEVEL: 360,        // average msgs per level
-  FASTEST_PORTION: 0.20,          // ~20% of avg msgs at best case
-  JITTER_PCT: 0.20,               // ±20% triangular jitter
-
-  // dynamic floor/ceiling relative to xpToNext(level)
-  MIN_FLOOR_ABS: 5,               // at least 5 XP
-  MIN_FLOOR_NEED_RATIO: 1 / 1200, // at least ~0.083% of need
-  MAX_CEIL_MIN_MSGS: 30,          // cap fastest path
-  // dynamicMax ≈ need / max(30, MESSAGES_PER_LEVEL * FASTEST_PORTION)
-
-  // lucky bonus layers (small spice, still safe under dynamic cap)
-  LUCKY_SMALL_CHANCE: 0.05,       // 5%
-  LUCKY_SMALL_BONUS: 0.03,        // +3% of target
-  LUCKY_BIG_CHANCE: 0.01,         // 1%
-  LUCKY_BIG_BONUS: 0.07,          // +7% of target
-});
-
-const lastXpAt = new Map(); // per-user XP cooldown
-
-// ---------------- Heist helpers ----------------
 async function maybeTriggerHeist(message) {
   const now = Date.now();
   if (heistActive) return;
@@ -72,13 +51,12 @@ async function maybeTriggerHeist(message) {
     new ButtonBuilder()
       .setCustomId('vaultrob_bigheist')
       .setLabel('💣 Rob the Vault')
-      .setStyle(ButtonStyle.Danger)
+      .setStyle(ButtonStyle.Danger),
   );
 
   try {
     await message.channel.send({ embeds: [embed], components: [row] });
-  } catch (e) {
-    console.warn('Failed to send Big Heist message:', e?.message || e);
+  } catch {
     heistActive = false;
     return;
   }
@@ -90,86 +68,94 @@ async function maybeTriggerHeist(message) {
   }, HEIST.DURATION_MS);
 }
 
-// ---------------- XP helpers ----------------
-function randTriangular(mean, amplitudePct) {
-  const amp = Math.max(0, Number(amplitudePct || 0)) * mean;
-  if (amp <= 0) return Math.round(mean);
-  const a = mean - amp;
-  const b = mean + amp;
-  const r1 = a + Math.random() * (b - a);
-  const r2 = a + Math.random() * (b - a);
-  return Math.round((r1 + r2) / 2);
+// ---------- XP bands & dynamic bounds ----------
+const MIN_FLOOR_ABS = 1;                // absolute minimum per message
+const MIN_FLOOR_NEED_RATIO = 1 / 1500;  // ≥ ~0.066% of need
+const MAX_PORTION_PER_MESSAGE = 1 / 60; // ≤ ~1.67% of need
+
+// Band weights (sum ≈ 1). Tune freely.
+const BAND_WEIGHTS = Object.freeze({
+  // 5–9: common   | 10–20: less common | 21–30: rare
+  A: 0.40,  // 5–9
+  B: 0.35,  // 10–20
+  C: 0.25,  // 21–30
+});
+
+// Geometric-like decay inside each band (higher XP rarer).
+// Larger DECAY_K => steeper drop-off.
+const DECAY_K = 0.22;
+
+// Sample a band according to weights
+function pickBand() {
+  const r = Math.random();
+  if (r < BAND_WEIGHTS.A) return [5, 9];
+  if (r < BAND_WEIGHTS.A + BAND_WEIGHTS.B) return [10, 20];
+  return [21, 30];
 }
 
-function computePerMessageXP(userRow) {
+// Sample an integer x in [min,max] with P(x) ∝ exp(-k * (x - min))
+function sampleMonotone(min, max, k = DECAY_K) {
+  const n = max - min + 1;
+  if (n <= 1) return min;
+
+  // Precompute unnormalized weights
+  let sum = 0;
+  const w = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const weight = Math.exp(-k * i);
+    w[i] = weight;
+    sum += weight;
+  }
+  // Draw
+  let r = Math.random() * sum;
+  for (let i = 0; i < n; i++) {
+    r -= w[i];
+    if (r <= 0) return min + i;
+  }
+  return max;
+}
+
+function computeXpGain(userRow) {
   const level = Math.max(1, Number(userRow?.level || 1));
   const need = Math.max(1, xpToNext(level));
 
-  // average target per message
-  const perMsgTarget = Math.max(1, Math.floor(need / XP.MESSAGES_PER_LEVEL));
+  // Dynamic bounds tied to level
+  const minDynamic = Math.max(MIN_FLOOR_ABS, Math.floor(need * MIN_FLOOR_NEED_RATIO));
+  const maxDynamic = Math.max(minDynamic + 1, Math.ceil(need * MAX_PORTION_PER_MESSAGE));
 
-  // randomize around target
-  let gain = randTriangular(perMsgTarget, XP.JITTER_PCT);
+  // Draw from configured bands
+  const [bMin, bMax] = pickBand();
+  let gain = sampleMonotone(bMin, bMax);
 
-  // lucky bonuses (added before clamping)
-  if (Math.random() < XP.LUCKY_SMALL_CHANCE) {
-    gain += Math.round(perMsgTarget * XP.LUCKY_SMALL_BONUS);
-  }
-  if (Math.random() < XP.LUCKY_BIG_CHANCE) {
-    gain += Math.round(perMsgTarget * XP.LUCKY_BIG_BONUS);
-  }
+  // Final clamp into dynamic bounds
+  if (gain < minDynamic) gain = minDynamic;
+  if (gain > maxDynamic) gain = maxDynamic;
 
-  // per-user multiplier (e.g., boosters)
-  const xpMult = Math.max(0, Number(userRow?.xp_multiplier ?? 1.0));
-  gain = Math.round(gain * xpMult);
-
-  // dynamic min/max frame based on need
-  const minDynamic = Math.max(
-    XP.MIN_FLOOR_ABS,
-    Math.floor(need * XP.MIN_FLOOR_NEED_RATIO)
-  );
-  const fastestMsgs = Math.max(
-    XP.MAX_CEIL_MIN_MSGS,
-    Math.floor(XP.MESSAGES_PER_LEVEL * XP.FASTEST_PORTION)
-  );
-  const maxDynamic = Math.max(minDynamic + 1, Math.ceil(need / fastestMsgs));
-
-  // clamp into the dynamic frame
-  gain = Math.max(minDynamic, Math.min(maxDynamic, gain));
-  return gain;
+  return { gain, minDynamic, maxDynamic };
 }
 
-async function grantMessageXP(message, db) {
-  const uid = message.author.id;
-  const now = Date.now();
-
-  // anti-spam cooldown (per user)
-  const last = lastXpAt.get(uid) || 0;
-  if (now - last < XP.COOLDOWN_MS) return;
-  lastXpAt.set(uid, now);
-
-  // ensure user exists
+async function applyXp(message, db) {
   const user = await initUser(message.author, db);
 
-  const gained = computePerMessageXP(user);
-  let xp = Math.max(0, Number(user.xp || 0)) + gained;
+  const { gain } = computeXpGain(user);
+
+  let xp = Math.max(0, Number(user.xp || 0)) + gain;
   let lvl = Math.max(1, Number(user.level || 1));
 
-  // handle multi-level overflows
+  // Multi-level overflow
   let levelsGained = 0;
   for (;;) {
-    const needed = xpToNext(lvl);
-    if (xp < needed) break;
-    xp -= needed;
+    const need = xpToNext(lvl);
+    if (xp < need) break;
+    xp -= need;
     lvl += 1;
     levelsGained += 1;
   }
 
   try {
-    await db.query(
-      'UPDATE users SET xp = $1, level = $2 WHERE user_id = $3',
-      [xp, lvl, uid]
-    );
+    await db.query('UPDATE users SET xp = $1, level = $2 WHERE user_id = $3', [
+      xp, lvl, message.author.id,
+    ]);
   } catch (e) {
     console.error('Failed to update XP:', e);
     return;
@@ -178,22 +164,16 @@ async function grantMessageXP(message, db) {
   if (levelsGained > 0) {
     const embed = new EmbedBuilder()
       .setTitle('🌟 Level Up!')
-      .setDescription(
-        `**${message.author.username}** reached **level ${lvl}** 🎉\n(+${gained} XP)`
-      )
+      .setDescription(`**${message.author.username}** reached **level ${lvl}** 🎉\n(+${gain} XP)`)
       .setColor(0x22c55e)
       .setThumbnail(message.author.displayAvatarURL({ forceStatic: false }))
       .setFooter({ text: `Levels gained this message: ${levelsGained}` })
       .setTimestamp();
-    try {
-      await message.channel.send({ embeds: [embed] });
-    } catch {}
+    try { await message.channel.send({ embeds: [embed] }); } catch {}
   }
 }
 
-// ---------------- Exported event ----------------
-let exportedActiveGetter = () => heistActive;
-
+// ---------- Exported event (compatible with your loader) ----------
 module.exports = {
   name: Events.MessageCreate,
 
@@ -205,19 +185,16 @@ module.exports = {
   async execute(message, bot, db) {
     try {
       if (message.author.bot) return;
-      // If you only want XP in guilds, uncomment:
+      // If you want XP only in guilds:
       // if (!message.guild) return;
 
-      // Optional: ignore very short/empty messages to reduce noise
-      // if (!message.content?.trim() && message.attachments.size === 0) return;
-
       await maybeTriggerHeist(message);
-      await grantMessageXP(message, db);
+      await applyXp(message, db);
     } catch (err) {
       console.error('messageCreate error:', err);
     }
   },
 
-  // allow other modules to check heist state
-  isBigHeistActive: () => exportedActiveGetter(),
+  // expose heist status if needed
+  isBigHeistActive: () => heistActive,
 };
