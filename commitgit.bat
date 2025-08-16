@@ -7,4 +7,3 @@ git commit -m "auto update at %date% %time%"
 
 git push origin main
 
-pause

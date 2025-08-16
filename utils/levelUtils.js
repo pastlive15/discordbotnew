@@ -1,90 +1,118 @@
 // utils/levelUtils.js
-// Smooth & Balanced Level Curve + Full Utilities
-// - Early/Mid: โตนิ่ม ๆ ไม่กระโดด
-// - Late: ยังท้าทาย แต่ไม่พุ่งเวอร์แบบเอ็กซ์โปเนนเชียล
-// - คง API เดิม: getXPNeeded() = xpToNext()
+// Refactored from scratch: same public API, clearer structure, safer math, memoized.
 
-// ---------------- Tunables (ปรับได้ตามรสนิยมเกมเพลย์) ----------------
-// เลเวล 1→2
-const BASE_XP = 110;
+// ---------------- Tunables (defaults) ----------------
+const DEFAULTS = Object.freeze({
+  BASE_XP: 110,            // L1->L2 baseline
+  XP_ALPHA: 1.60,          // polynomial growth (softly steeper at higher levels)
+  XP_BETA: 0.007,          // linear blend for mid-game
+  BOOST_L100: 1.05,        // light late-game boosts
+  BOOST_L150: 1.12,
+  MIN_GROWTH_PER_LEVEL: 1.03, // clamp range to avoid jumps
+  MAX_GROWTH_PER_LEVEL: 1.12,
+  LATE_SOFT_START: 120,    // soft bonus curve start
+  LATE_SOFT_A: 0.25,       // max ~+25%
+  LATE_SOFT_B: 0.015,      // slope
+  MAX_BAR_SIZE: 20,
+  DEFAULT_MAX_LEVEL: 0,    // 0 = no cap
+});
 
-// โค้งหลัก (พหุนาม + เชิงเส้นผสม)
-const XP_ALPHA = 1.60;    // ยิ่งสูง ค่าเลเวลยิ่งแพงขึ้นแบบ “นิ่ม”
-const XP_BETA  = 0.007;   // ส่วนเพิ่มเชิงเส้น ช่วยช่วง mid-game
+// active configuration (mutable only via setConfig)
+let CFG = { ...DEFAULTS };
 
-// บูสต์ปลายเกม “เบา ๆ” (ไม่พุ่งเวอร์)
-const BOOST_L100 = 1.05;  // เริ่มรู้สึกยากขึ้นเล็กน้อยเมื่อ >=100
-const BOOST_L150 = 1.12;  // เพิ่มอีกนิดเมื่อ >=150
+/**
+ * Update tunables at runtime (partial).
+ * Unknown keys are ignored; invalid values are clamped safely.
+ * @param {Partial<typeof DEFAULTS>} partial
+ */
+function setConfig(partial = {}) {
+  if (!partial || typeof partial !== 'object') return;
+  const next = { ...CFG, ...partial };
+  // safety clamps
+  next.BASE_XP = clampInt(next.BASE_XP, 1, 10_000);
+  next.XP_ALPHA = clampNum(next.XP_ALPHA, 1.0, 3.0);
+  next.XP_BETA = clampNum(next.XP_BETA, 0, 0.1);
+  next.BOOST_L100 = clampNum(next.BOOST_L100, 1.0, 2.0);
+  next.BOOST_L150 = clampNum(next.BOOST_L150, 1.0, 2.0);
+  next.MIN_GROWTH_PER_LEVEL = clampNum(next.MIN_GROWTH_PER_LEVEL, 1.0, 1.5);
+  next.MAX_GROWTH_PER_LEVEL = clampNum(next.MAX_GROWTH_PER_LEVEL, 1.0, 2.0);
+  if (next.MAX_GROWTH_PER_LEVEL < next.MIN_GROWTH_PER_LEVEL) {
+    next.MAX_GROWTH_PER_LEVEL = next.MIN_GROWTH_PER_LEVEL;
+  }
+  next.LATE_SOFT_START = clampInt(next.LATE_SOFT_START, 1, 10_000);
+  next.LATE_SOFT_A = clampNum(next.LATE_SOFT_A, 0, 1);
+  next.LATE_SOFT_B = clampNum(next.LATE_SOFT_B, 0, 1);
+  next.MAX_BAR_SIZE = clampInt(next.MAX_BAR_SIZE, 5, 40);
+  next.DEFAULT_MAX_LEVEL = clampInt(next.DEFAULT_MAX_LEVEL, 0, 10_000);
+  CFG = next;
+}
 
-// Smoothing: จำกัดอัตราเติบโตต่อเลเวลให้อยู่ในกรอบที่สมเหตุผล
-//  - ไม่ให้กระโดดเกินไป (max growth)
-//  - ไม่ให้แบนจนแทบไม่ต่าง (min growth)
-const MIN_GROWTH_PER_LEVEL = 1.03; // อย่างน้อย +3% ต่อขั้น
-const MAX_GROWTH_PER_LEVEL = 1.12; // ไม่เกิน ~+12% ต่อขั้น
+// ---------------- Core math (pure) ----------------
 
-// Late-game soft bonus (ค่อย ๆ ไต่ ไม่กระโดด)
-const LATE_SOFT_START = 120;
-const LATE_SOFT_A = 0.25;  // เพดานบูสต์รวม ~+25%
-const LATE_SOFT_B = 0.015; // ความชันในการไต่
-
-// UI
-const MAX_BAR_SIZE = 20;
-// เพดานเลเวล (0 = no cap)
-const DEFAULT_MAX_LEVEL = 0;
-
-// ---------------- Core Math ----------------
-
-// โค้งพื้นฐาน “ก่อน” ทำ smoothing ต่อขั้น
+/**
+ * Base (raw) XP curve before smoothing clamps.
+ * @param {number} level >=1
+ * @returns {number} integer XP required for this level step (raw)
+ */
 function baseCurve(level) {
-  const L = Math.max(1, Number(level || 1));
+  const L = Math.max(1, Math.floor(Number(level) || 1));
 
   let mult = 1.0;
-  if (L >= 100) mult *= BOOST_L100;
-  if (L >= 150) mult *= BOOST_L150;
+  if (L >= 100) mult *= CFG.BOOST_L100;
+  if (L >= 150) mult *= CFG.BOOST_L150;
 
-  // late soft bonus: 1 + A * (1 - e^{-B*(L - start)})
-  if (L >= LATE_SOFT_START) {
-    const t = L - LATE_SOFT_START;
-    mult *= 1 + LATE_SOFT_A * (1 - Math.exp(-LATE_SOFT_B * t));
+  if (L >= CFG.LATE_SOFT_START) {
+    const t = L - CFG.LATE_SOFT_START;
+    mult *= 1 + CFG.LATE_SOFT_A * (1 - Math.exp(-CFG.LATE_SOFT_B * t));
   }
 
-  const raw = BASE_XP * Math.pow(L, XP_ALPHA) * (1 + XP_BETA * L) * mult;
+  const raw = CFG.BASE_XP * Math.pow(L, CFG.XP_ALPHA) * (1 + CFG.XP_BETA * L) * mult;
   return Math.max(1, Math.floor(raw));
 }
 
+// memoization for xpToNext (stable across common loops)
+const xpNextMemo = new Map();
+
 /**
- * XP ที่ต้องใช้เพื่อไปจาก level → level+1 (หลัง smoothing)
- * - ใช้ baseCurve เป็น “ค่าตั้งต้น”
- * - บังคับให้ความต่างจากขั้นก่อนหน้าอยู่ในกรอบ [minGrowth, maxGrowth]
- * - ป้องกันบัค “ติดเพดานคงที่” ด้วยการ clamp ทิศทางที่ถูกต้อง
+ * XP needed to go from level -> level+1 after smoothing.
+ * Smoothing clamps growth to [MIN, MAX] relative to prev step to avoid spikes.
+ * @param {number} level
  */
 function xpToNext(level) {
-  const L = Math.max(1, Number(level || 1));
-  if (L === 1) return baseCurve(1);
+  const key = Math.max(1, Math.floor(level || 1));
+  if (xpNextMemo.has(key)) return xpNextMemo.get(key);
 
-  const prev = baseCurve(L - 1);
-  const curRaw = baseCurve(L);
+  if (key === 1) {
+    const v = baseCurve(1);
+    xpNextMemo.set(key, v);
+    return v;
+  }
 
-  const minAllowed = Math.ceil(prev * MIN_GROWTH_PER_LEVEL);
-  const maxAllowed = Math.floor(prev * MAX_GROWTH_PER_LEVEL);
+  const prev = baseCurve(key - 1);
+  const curRaw = baseCurve(key);
 
-  // ✅ สำคัญ: ต้อง clamp “curRaw” ให้อยู่ในช่วง [minAllowed, maxAllowed] ก่อน
-  // แล้วค่อย ensure ว่าไม่ต่ำกว่า prev+1 เพื่อความเป็นขั้นบันได
-  const clamped = Math.min(Math.max(curRaw, minAllowed), maxAllowed);
-  return Math.max(prev + 1, clamped);
+  const minAllowed = Math.ceil(prev * CFG.MIN_GROWTH_PER_LEVEL);
+  const maxAllowed = Math.floor(prev * CFG.MAX_GROWTH_PER_LEVEL);
+
+  // Clamp and ensure stepwise increase
+  const clamped = clampInt(curRaw, minAllowed, maxAllowed);
+  const result = Math.max(prev + 1, clamped);
+
+  xpNextMemo.set(key, result);
+  return result;
 }
 
-// Back-compat alias
+/** Back-compat alias. */
 function getXPNeeded(level) {
   return xpToNext(level);
 }
 
 /**
- * Total XP ที่ต้องใช้เพื่อ “ถึง” เลเวล L (รวมตั้งแต่เลเวล 1)
- * O(L) แต่เร็วพอสำหรับเกมเศรษฐกิจทั่วไป
+ * Total cumulative XP required to reach level L (sum of steps).
+ * O(L) with memoized steps; adequate for gameplay use.
  */
 function totalXpForLevel(level) {
-  const L = Math.floor(level);
+  const L = Math.floor(level || 1);
   if (L <= 1) return 0;
   let sum = 0;
   for (let k = 1; k < L; k++) sum += xpToNext(k);
@@ -92,70 +120,82 @@ function totalXpForLevel(level) {
 }
 
 /**
- * แปลง total XP (สะสม) → { level, inLevel, toNext }
- * เดินหน้าเพิ่มทีละขั้น เพื่อแมตช์กับโค้ง smoothing
+ * Convert total accumulated XP -> { level, inLevel, toNext }.
+ * Walk forward using the memoized xpToNext for perfect consistency.
  */
 function levelFromTotalXp(totalXp) {
-  const S = Math.max(0, Number(totalXp || 0));
+  const S = Math.max(0, Math.floor(Number(totalXp) || 0));
   if (S <= 0) return { level: 1, inLevel: 0, toNext: xpToNext(1) };
 
   let level = 1;
   let acc = 0;
-  while (true) {
+  for (;;) {
     const need = xpToNext(level);
     if (acc + need > S) break;
     acc += need;
-    level += 1;
+    level++;
   }
   const inLevel = S - acc;
   const toNext = xpToNext(level);
   return { level, inLevel, toNext };
 }
 
-// ---------------- Progress Bar ----------------
-function generateProgressBar(current, total, size = MAX_BAR_SIZE, charset = {}) {
+// ---------------- Progress / UI ----------------
+
+/**
+ * Render a simple text progress bar.
+ * @param {number} current
+ * @param {number} total
+ * @param {number} size
+ * @param {{filled?:string, empty?:string, left?:string, right?:string}} charset
+ */
+function generateProgressBar(current, total, size = CFG.MAX_BAR_SIZE, charset = {}) {
   const { filled = '▰', empty = '▱', left = '', right = '' } = charset;
-  const t = Math.max(1, Number(total || 1));
-  const ratio = Math.max(0, Math.min(1, Number(current || 0) / t));
+  const t = Math.max(1, Math.floor(total || 1));
+  const ratio = clampNum((Number(current) || 0) / t, 0, 1);
   const fillCount = Math.round(size * ratio);
   const emptyCount = Math.max(0, size - fillCount);
   return `${left}${filled.repeat(fillCount)}${empty.repeat(emptyCount)}${right}`;
 }
 
+/**
+ * Convenience progress info bundle for a level.
+ */
 function makeLevelProgress(level, inLevelXp, opts = {}) {
   const toNext = xpToNext(level);
-  const barSize = Number(opts.barSize ?? MAX_BAR_SIZE);
+  const barSize = clampInt(opts.barSize ?? CFG.MAX_BAR_SIZE, 5, 40);
   const bar = generateProgressBar(inLevelXp, toNext, barSize, opts.charset);
-  const percent = Math.min(100, Math.max(0, Math.round((inLevelXp / Math.max(1, toNext)) * 100)));
-  return { level, inLevel: inLevelXp, toNext, bar, percent };
+  const percent = Math.round(clampNum((Number(inLevelXp) || 0) / Math.max(1, toNext), 0, 1) * 100);
+  return { level, inLevel: Math.max(0, Math.floor(inLevelXp || 0)), toNext, bar, percent };
 }
 
-// ---------------- Add XP (รองรับ multipliers + ล้นหลายเลเวล) ----------------
+// ---------------- XP Gain (multi-level overflow + caps) ----------------
+
 /**
- * เพิ่ม XP ให้คู่ (level, inLevelXp)
- * opts:
- *  - xpMultiplier: ตัวคูณเฉพาะผู้ใช้ (เช่น premium)
- *  - globalMultiplier: ตัวคูณรวม (เช่น event)
- *  - round: ปัดเป็นก้าวทีละ N (เช่น 5/10)
- *  - maxLevel: เพดานเลเวล (0 = ไม่มี)
+ * Add XP to a (level, inLevelXp) pair with multipliers, rounding, and cap.
+ * @param {number} level
+ * @param {number} inLevelXp
+ * @param {number} baseGain
+ * @param {{xpMultiplier?:number, globalMultiplier?:number, round?:number, maxLevel?:number}} opts
+ * @returns {{level:number,inLevel:number,gained:number,levelsUp:number,capped:boolean}}
  */
 function addXp(level, inLevelXp, baseGain, opts = {}) {
   let L = Math.max(1, Math.floor(level || 1));
   let X = Math.max(0, Math.floor(inLevelXp || 0));
 
   const mult = Math.max(0, Number(opts.xpMultiplier ?? 1)) * Math.max(0, Number(opts.globalMultiplier ?? 1));
-  let gain = Math.max(0, Number(baseGain || 0)) * mult;
+  let gain = Math.max(0, Math.floor(Number(baseGain) || 0) * mult);
 
   const step = Math.max(1, Math.floor(opts.round ?? 1));
   gain = Math.floor(gain / step) * step;
 
-  let remaining = Math.floor(gain);
+  let remaining = gain;
   let levelsUp = 0;
-  const cap = Math.max(0, Math.floor(opts.maxLevel || DEFAULT_MAX_LEVEL)); // 0 = no cap
+  const cap = Math.max(0, Math.floor(opts.maxLevel ?? CFG.DEFAULT_MAX_LEVEL)); // 0 = no cap
   let capped = false;
 
   while (remaining > 0) {
-    const need = xpToNext(L) - X;       // ต้องเติมอีกเท่าไหร่ถึงจะอัป
+    const need = xpToNext(L) - X;
     if (remaining >= need) {
       remaining -= need;
       L += 1;
@@ -164,7 +204,6 @@ function addXp(level, inLevelXp, baseGain, opts = {}) {
 
       if (cap && L >= cap) {
         L = cap;
-        // กัน X เกิน next (เวลามี cap)
         X = Math.min(xpToNext(L) - 1, X);
         capped = true;
         break;
@@ -175,26 +214,33 @@ function addXp(level, inLevelXp, baseGain, opts = {}) {
     }
   }
 
-  return { level: L, inLevel: X, gained: Math.floor(gain), levelsUp, capped };
+  return { level: L, inLevel: X, gained: gain, levelsUp, capped };
 }
 
-// ---------------- UI Helper ----------------
+// ---------------- Utilities ----------------
+const fmt = (n) => new Intl.NumberFormat().format(Number(n || 0));
 function formatLevelLine(level, inLevelXp, opts = {}) {
   const p = makeLevelProgress(level, inLevelXp, opts);
   return `Level **${p.level}** — **${fmt(p.inLevel)} / ${fmt(p.toNext)} XP** (${p.percent}%)\n${p.bar}`;
 }
 
-function fmt(n) { return new Intl.NumberFormat().format(Number(n || 0)); }
+// ---------------- Helpers ----------------
+function clampNum(v, lo, hi) { return Math.min(hi, Math.max(lo, Number(v) || 0)); }
+function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, Math.floor(Number(v) || 0))); }
 
 // ---------------- Exports ----------------
 module.exports = {
-  // Tunables (ถ้าโมดูลอื่นอยากอ่าน)
-  BASE_XP, XP_ALPHA, XP_BETA,
-  MAX_BAR_SIZE, DEFAULT_MAX_LEVEL,
+  // Tunables
+  get BASE_XP() { return CFG.BASE_XP; },
+  get XP_ALPHA() { return CFG.XP_ALPHA; },
+  get XP_BETA() { return CFG.XP_BETA; },
+  get MAX_BAR_SIZE() { return CFG.MAX_BAR_SIZE; },
+  get DEFAULT_MAX_LEVEL() { return CFG.DEFAULT_MAX_LEVEL; },
+  setConfig,
 
   // Core math
-  xpToNext,            // <- ใช้ใน messageCreate.js / commands
-  getXPNeeded,         // <- alias back-compat
+  xpToNext,           // used across events/commands
+  getXPNeeded,        // alias (back-compat)
   totalXpForLevel,
   levelFromTotalXp,
 
