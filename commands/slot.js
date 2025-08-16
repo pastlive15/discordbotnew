@@ -11,9 +11,9 @@ const COLORS = { GREEN: 0x22c55e, RED: 0xef4444, GOLD: 0xf59e0b };
 
 // Keep your custom guild emojis first, then safe Unicode fallbacks.
 const SYMBOLS = [
-  '<:DP_slots_eggplant93:1392958941381791924>',
-  '<:dp_slots_hearts33:1392958885379444746>',
-  '<:DP_slots_cherry:1392959017281654784>',
+  //'<:DP_slots_eggplant93:1392958941381791924>',
+  //'<:dp_slots_hearts33:1392958885379444746>',
+  //'<:DP_slots_cherry:1392959017281654784>',
   '🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'
 ]; // >= 6 symbols so "no match" is possible on 4 reels
 
