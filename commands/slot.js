@@ -1,54 +1,61 @@
 // commands/slot.js
-// Balanced Slot: 4 reels, richer symbol set, proper losing outcomes.
-// - Atomic UPDATE with WHERE money >= bet RETURNING
-// - "all" supported
-// - Profit multiplier applies to PROFIT only (not losses), same policy as before.
+// Balanced Slot (v2): easier win rate a bit + new payouts.
+// - 4 reels, richer symbols, proper losing outcomes.
+// - Slight "repeat bias" to increase pairs/triples a little.
+// - Atomic UPDATE; "all" bet supported; profit multiplier applies to profit only.
 
 const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const { initUser } = require('../utils/initUser');
 
 const COLORS = { GREEN: 0x22c55e, RED: 0xef4444, GOLD: 0xf59e0b };
 
-// Keep your custom guild emojis first, then safe Unicode fallbacks.
+// >= 6–7 symbols so "no match" still possible on 4 reels
 const SYMBOLS = [
-  //'<:DP_slots_eggplant93:1392958941381791924>',
-  //'<:dp_slots_hearts33:1392958885379444746>',
-  //'<:DP_slots_cherry:1392959017281654784>',
+  '<:DP_slots_eggplant93:1392958941381791924>',
+  '<:dp_slots_hearts33:1392958885379444746>',
+  '<:DP_slots_cherry:1392959017281654784>',
   '🍋', '🍉', '🍇', '⭐', '🔔', '7️⃣'
-]; // >= 6 symbols so "no match" is possible on 4 reels
+];
 
 const REELS = 4;
 const REEL_DELAY_MS = 550;
 const SPIN_EMOJI = '<a:DP_slots_spin28:1392958778692997190>' || '🔄';
 
-// New balanced payouts
-// - 4-kind: big jackpot
-// - 3-kind: solid win
-// - two_pairs: decent win
-// - one_pair: small loss (house edge)
-// - none: full loss
+// New friendlier payouts (slightly higher EV, higher win rate)
 const PAYOUTS = Object.freeze({
-  four_kind: 10.0,   // x10
-  three_kind: 3.0,   // x3
-  two_pairs: 2.0,    // x2
-  one_pair: 0.5,     // x0.5 (lose half)
-  none: 0.0,         // x0
+  four_kind: 12.0,  // up from 10.0
+  three_kind: 4.0,  // up from 3.0
+  two_pairs: 2.5,   // up from 2.0
+  one_pair: 1.0,    // up from 0.5 (still a small loss)
+  none: 0.0,
 });
 
-// Soften pure jackpot spikes (re-roll 80% if 4OAK)
-const JACKPOT_REROLL_P = 0.80;
+// Slightly easier jackpots
+const JACKPOT_REROLL_P = 0.50; // was 0.80
+
+// Small bias to repeat previous symbols on later reels (↑ pairs/triples a bit)
+const REPEAT_BIAS = 0.10; // 10%
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
 
 function rollOnce() {
-  return Array.from({ length: REELS }, () => SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)]);
+  const result = [];
+  for (let i = 0; i < REELS; i++) {
+    if (i > 0 && Math.random() < REPEAT_BIAS) {
+      // pick randomly among previous reels to copy → slight match bias
+      const j = Math.floor(Math.random() * i);
+      result.push(result[j]);
+    } else {
+      result.push(SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)]);
+    }
+  }
+  return result;
 }
 
 function classify(result) {
-  // count frequencies
   const count = {};
   for (const s of result) count[s] = (count[s] || 0) + 1;
-  const freqs = Object.values(count).sort((a, b) => b - a); // e.g., [2,2] or [3,1] or [1,1,1,1]
+  const freqs = Object.values(count).sort((a, b) => b - a);
   if (freqs[0] === 4) return 'four_kind';
   if (freqs[0] === 3) return 'three_kind';
   if (freqs[0] === 2) {
@@ -83,8 +90,7 @@ module.exports = {
     ),
 
   async execute(interaction, db) {
-    // NOTE: make sure initUser takes (user, db) like your other modules
-    const user = await initUser(interaction.user, db); // was initUser(interaction.user) before
+    const user = await initUser(interaction.user, db);
     if (!user) {
       return interaction.reply({ content: '❌ You need a profile to play.', flags: MessageFlags.Ephemeral });
     }
@@ -94,13 +100,9 @@ module.exports = {
 
     const betInput = (interaction.options.getString('bet') || '').trim().toLowerCase();
     let bet;
-    if (betInput === 'all') {
-      bet = wallet;
-    } else if (/^\d+$/.test(betInput.replace(/,/g, ''))) {
-      bet = Math.floor(Number(betInput.replace(/,/g, '')));
-    } else {
-      bet = NaN;
-    }
+    if (betInput === 'all') bet = wallet;
+    else if (/^\d+$/.test(betInput.replace(/,/g, ''))) bet = Math.floor(Number(betInput.replace(/,/g, '')));
+    else bet = NaN;
 
     if (!Number.isFinite(bet) || bet <= 0) {
       return interaction.reply({
@@ -133,7 +135,7 @@ module.exports = {
       await interaction.editReply({ content: `🎰 Spinning...\n${display.join(' | ')}` });
     }
 
-    // Compute payout with new table; profit-only multiplier
+    // Compute payout; profit-only multiplier
     const multiplier = PAYOUTS[hand] ?? 0;
     const rawReturn = bet * multiplier;
     const totalBase = Math.floor(rawReturn);
