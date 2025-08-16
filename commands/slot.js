@@ -21,35 +21,35 @@ const REELS = 4;
 const REEL_DELAY_MS = 550;
 const SPIN_EMOJI = '<a:DP_slots_spin28:1392958778692997190>' || '🔄';
 
-// New friendlier payouts (slightly higher EV, higher win rate)
+// Friendlier payouts from previous step
 const PAYOUTS = Object.freeze({
-  four_kind: 12.0,  // up from 10.0
-  three_kind: 4.0,  // up from 3.0
-  two_pairs: 2.5,   // up from 2.0
-  one_pair: 1.0,    // up from 0.5 (still a small loss)
+  four_kind: 12.0,
+  three_kind: 4.0,
+  two_pairs: 2.5,
+  one_pair: 0.8, // still a small loss
   none: 0.0,
 });
 
-// Slightly easier jackpots
-const JACKPOT_REROLL_P = 0.60; // was 0.80
+// Jackpots a bit easier than before (kept)
+const JACKPOT_REROLL_P = 0.50;
 
-// Small bias to repeat previous symbols on later reels (↑ pairs/triples a bit)
-const REPEAT_BIAS = 0.15; // 10%
+// --- New tuning knobs to cut "one pair" frequency ---
+const REPEAT_BIAS = 0.06; // was 0.10 -> lower chance to copy previous symbols
+// If the current pick would create the FIRST pair of the spin (no pair existed yet),
+// we veto it with these probabilities per reel index (1-based thinking: reels 2..4).
+// High veto at reel 2 (strong cut of single-pair), milder at reel 3..4 to preserve 3-kind/two-pairs.
+const SINGLE_PAIR_VETO = [0.00, 0.60, 0.35, 0.20]; // index by i (0..3), used for i>0
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
 
-function rollOnce() {
-  const result = [];
-  for (let i = 0; i < REELS; i++) {
-    if (i > 0 && Math.random() < REPEAT_BIAS) {
-      // pick randomly among previous reels to copy → slight match bias
-      const j = Math.floor(Math.random() * i);
-      result.push(result[j]);
-    } else {
-      result.push(SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)]);
-    }
+function randomSymbol(exclude = null) {
+  if (!exclude || exclude.size === 0 || exclude.size >= SYMBOLS.length) {
+    return SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
   }
-  return result;
+  // pick a symbol not in exclude (try a few times; fallback to any)
+  const pool = SYMBOLS.filter(s => !exclude.has(s));
+  if (pool.length === 0) return SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 function classify(result) {
@@ -64,6 +64,45 @@ function classify(result) {
     return 'one_pair';
   }
   return 'none';
+}
+
+function aboutToCreateFirstPair(currentSymbols, candidate) {
+  if (currentSymbols.length === 0) return false;
+  // Count existing
+  const count = {};
+  for (const s of currentSymbols) count[s] = (count[s] || 0) + 1;
+  const hasPairAlready = Object.values(count).some(v => v >= 2);
+  if (hasPairAlready) return false; // not the *first* pair
+
+  // Would candidate match any existing symbol and make a pair?
+  return currentSymbols.includes(candidate);
+}
+
+function rollOnce() {
+  const result = [];
+  for (let i = 0; i < REELS; i++) {
+    // default candidate: repeat bias or fresh draw
+    let candidate;
+    if (i > 0 && Math.random() < REPEAT_BIAS) {
+      const j = Math.floor(Math.random() * i);
+      candidate = result[j];
+    } else {
+      candidate = randomSymbol();
+    }
+
+    // If this would create the *first* pair, veto with probability SINGLE_PAIR_VETO[i]
+    if (i > 0 && aboutToCreateFirstPair(result, candidate)) {
+      const vetoP = SINGLE_PAIR_VETO[i] || 0;
+      if (Math.random() < vetoP) {
+        // try to pick a symbol that doesn't appear yet (avoid making that first pair)
+        const exclude = new Set(result); // avoid *any* seen so far
+        candidate = randomSymbol(exclude);
+      }
+    }
+
+    result.push(candidate);
+  }
+  return result;
 }
 
 function rollResult() {
@@ -118,7 +157,7 @@ module.exports = {
       return interaction.reply({ content: `💸 You don’t have enough coins. Balance: **${fmt(wallet)}**`, flags: MessageFlags.Ephemeral });
     }
 
-    // Animated spin (message then edit)
+    // Animated spin
     const spinningRow = Array(REELS).fill(SPIN_EMOJI);
     await interaction.reply({
       content: `🎰 Spinning...\n${spinningRow.join(' | ')}`,
@@ -135,7 +174,7 @@ module.exports = {
       await interaction.editReply({ content: `🎰 Spinning...\n${display.join(' | ')}` });
     }
 
-    // Compute payout; profit-only multiplier
+    // Payout (profit-only multiplier)
     const multiplier = PAYOUTS[hand] ?? 0;
     const rawReturn = bet * multiplier;
     const totalBase = Math.floor(rawReturn);
