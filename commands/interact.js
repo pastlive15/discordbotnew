@@ -195,7 +195,7 @@ module.exports = {
 
     const collector = msg.createMessageComponentCollector({
       componentType: ComponentType.Button,
-      time: 15_000,
+      time: 1_200_000,
       max: 1, // #ให้ปุ่มทำงานได้ครั้งเดียว
       filter: (btn) =>
         btn.customId === `interact_back_${actionKey}` && btn.user.id === target.id,

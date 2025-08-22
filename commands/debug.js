@@ -1,5 +1,5 @@
 // commands/debug.js
-const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const os = require('os');
 const fs = require('fs');
 
@@ -89,6 +89,7 @@ Memory: ${bytesFmt(usedMem)} Used / ${bytesFmt(totalMem)} (Swap: ${bytesFmt(swap
       .setDescription(desc)
       .setTimestamp();
 
-    return interaction.reply({ embeds:[embed], flags: MessageFlags.Ephemeral });
+    // ✅ reply แบบ public ทุกคนเห็น
+    return interaction.reply({ embeds:[embed] });
   }
 };
