@@ -5,22 +5,33 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "prepare": "husky install"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@napi-rs/canvas": "^0.1.77",
-    "discord.js": "^14.21.0",
-    "dotenv": "^17.0.1",
-    "fs": "^0.0.1-security",
-    "mongodb": "^6.17.0",
-    "nodeman": "^1.1.2",
-    "path": "^0.12.7",
-    "pg": "^8.16.3"
+    "discord.js": "^14.22.1",
+    "dotenv": "^17.2.1",
+    "mongodb": "^6.18.0",
+    "pg": "^8.16.3",
+    "pino": "^9.5.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.10"
+    "eslint": "^9.9.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.29.1",
+    "husky": "^9.1.6",
+    "lint-staged": "^15.2.10",
+    "nodemon": "^3.1.10",
+    "pino-pretty": "^11.2.2",
+    "prettier": "^3.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

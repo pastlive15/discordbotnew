@@ -14,6 +14,7 @@ const {
 
 const db = require('./db');
 const { sendErrorToWebhook } = require('./utils/webhookErrorLogger');
+const logger = require('./utils/logger');
 
 // ---------- Global process guards ----------
 process.on('uncaughtException', (error) => {

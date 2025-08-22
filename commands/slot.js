@@ -64,7 +64,7 @@ const NORMAL_PAYOUTS = Object.freeze({
 const JACKPOT_REROLL_P = 0.50;
 
 // Tuning to reduce only-one-pair frequency
-const REPEAT_BIAS = 0.06;                         // chance to copy a previous reel
+const REPEAT_BIAS = 0.29;                         // chance to copy a previous reel
 const SINGLE_PAIR_VETO = [0.00, 0.60, 0.35, 0.20]; // veto first pair on reels 2..4
 
 const fmt = (n) => new Intl.NumberFormat().format(Math.max(0, Number(n || 0)));
